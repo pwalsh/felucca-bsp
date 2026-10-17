@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MPL-2.0
- * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments */
+ * Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments
+ * Copyright (C) 2026 Charles Vestal (VDC14 and SYSVDD, the second core held on reset) */
 /* FM-1 system HAL: P33 access, watchdog, reset reason, reboot / UBOOT entry
  * No vendor code; call with interrupts off
  * (no IRQs are enabled yet, so nothing else touches P33).
@@ -15,10 +16,13 @@
  *   fm1_updata_parm_clear()  zero the record (CRC 0: ignored on a warm reset)
  *   fm1_mailbox_clear()  zero 0x01C7FD80..0x01C7FDFF (boot info, mailbox) at cold start
  *   fm1_mem_readable(a, n) / fm1_peek8(a)   debug reads of RAM / XIP only
+ *   fm1_vdc14_raise(l)   VDC14 up to level l, a step at a time; fm1_vdc14() reads it
+ *   fm1_sysvdd_raise(l)  SYSVDD (the core and SRAM rail) the same; fm1_sysvdd() reads it
  */
 #pragma once
 #include <stdint.h>
 #include "fm1_cc.h"
+#include "fm1_time.h"
 
 #define FM1_P33_CON (*(volatile uint32_t *)0x13E08u)
 #define FM1_P33_DAT (*(volatile uint32_t *)0x13E0Cu)
@@ -77,6 +81,36 @@ static void fm1_p33_write(uint32_t a, uint8_t d) { fm1__p33_op(0, a, d); }
 static void fm1_p33_or(uint32_t a, uint8_t d) { fm1__p33_op(1, a, d); }
 static void fm1_p33_and(uint32_t a, uint8_t d) { fm1__p33_op(2, a, d); }
 
+/* ------------------------------------------------------- VDC14, SYSVDD --- */
+/* VDC14 (P3_ANA_CON6 [2:0]): 1.25 V + 50 mV a level; SYSVDD (P3_ANA_CON9 [3:0], the core and SRAM):
+ * 0.93 V + 30 mV a level. The boot loader leaves 3 (1.40 V) and 11 (1.26 V); M-VAVE's own firmware
+ * (V15) raises them to 7 (1.60 V) and 15 (1.38 V) as it starts, at the same 360 MHz (fm1-x0x#21,
+ * fc79's reading of its __hw_power_init). At the boot loader's, under load (both cores, or WiFi in
+ * fm1-radio), some units read flash and SRAM wrong. Up only, a level per 100 us, VDC14 first (as
+ * Jangada's fm1_core_supply): SYSVDD is regulated from it. */
+#define FM1_P3_ANA_CON6 0x06u
+#define FM1_P3_ANA_CON9 0x09u
+static uint32_t fm1_vdc14(void) { return fm1_p33_read(FM1_P3_ANA_CON6) & 7u; }
+static void fm1_vdc14_raise(uint32_t level)
+{
+    uint32_t v = fm1_vdc14();
+    while (v < level && v < 7u) {
+        v++;
+        fm1_p33_write(FM1_P3_ANA_CON6, (uint8_t)((fm1_p33_read(FM1_P3_ANA_CON6) & ~7u) | v));
+        fm1_delay_us(100);
+    }
+}
+static uint32_t fm1_sysvdd(void) { return fm1_p33_read(FM1_P3_ANA_CON9) & 15u; }
+static void fm1_sysvdd_raise(uint32_t level)
+{
+    uint32_t v = fm1_sysvdd();
+    while (v < level && v < 15u) {
+        v++;
+        fm1_p33_write(FM1_P3_ANA_CON9, (uint8_t)((fm1_p33_read(FM1_P3_ANA_CON9) & ~15u) | v));
+        fm1_delay_us(100);
+    }
+}
+
 /* ------------------------------------------------------------ watchdog --- */
 #define FM1_P3_WDT_CON 0x80u
 #define FM1_P3_VLD_KEEP 0x17u
@@ -92,6 +126,36 @@ static void fm1_wdt_arm(uint8_t t)
 }
 static void fm1_wdt_feed(void) { fm1_p33_or(FM1_P3_WDT_CON, 0x40); }
 static void fm1_wdt_stop(void) { fm1_p33_write(FM1_P3_WDT_CON, 0); }
+
+/* the watchdog feed and a busy wait with nothing called, for code that runs from RAM (.ram_text) while the flash
+ * must not be touched: the Bluetooth radio's trim (JieLi's, ~500 ms of high current) runs its delays here */
+FM1_INLINE void fm1__p33_xfer_inl(uint8_t b)
+{
+    uint32_t n = 100000u;
+    FM1_P33_DAT = b;
+    FM1_P33_CON |= 1u << 4;
+    (void)FM1_P33_CON;
+    while ((FM1_P33_CON & (1u << 1)) && --n)
+        ;
+}
+FM1_INLINE void fm1_wdt_feed_inl(void)            /* fm1_wdt_feed: P33 "or" WDT_CON, 0x40 */
+{
+    FM1_P33_CON &= ~(1u << 8);
+    FM1_P33_CON |= 1u << 0;
+    fm1__p33_xfer_inl((uint8_t)((1u << 5) | ((FM1_P3_WDT_CON >> 8) & 3u)));
+    fm1__p33_xfer_inl((uint8_t)FM1_P3_WDT_CON);
+    fm1__p33_xfer_inl(0x40);
+    FM1_P33_CON &= ~((1u << 0) | (1u << 8));
+}
+FM1_INLINE void fm1_busy_us_inl(uint32_t us)      /* TIMER4; the watchdog fed every millisecond */
+{
+    uint32_t t0 = FM1_T4_CNT, fed = t0, span = us * FM1_TICKS_PER_US;
+    while ((uint32_t)(FM1_T4_CNT - t0) < span)
+        if ((uint32_t)(FM1_T4_CNT - fed) >= 1000u * FM1_TICKS_PER_US) {
+            fed = FM1_T4_CNT;
+            fm1_wdt_feed_inl();
+        }
+}
 
 /* ---------------------------------------------------- reset and reboot --- */
 static struct {
@@ -110,6 +174,8 @@ static void fm1_reset_reason(void)
 static void fm1_reboot(void)
 {
     __asm__ volatile("cli");
+    *(volatile uint32_t *)0x1EEE004u |= 0x2u;          /* the second core held (fm1_cpu1.h) */
+    *(volatile uint32_t *)0x1EEE004u &= ~0x8u;
     fm1_p33_or(FM1_P3_PR_PWR, 0x10);
     for (;;)
         ;
@@ -133,6 +199,8 @@ static void fm1_enter_uboot(void)
 
 FM1_INLINE void fm1_core_reset(void)
 {
+    *(volatile uint32_t *)0x1EEE004u |= 0x2u;          /* the second core held first (fm1_cpu1.h): it */
+    *(volatile uint32_t *)0x1EEE004u &= ~0x8u;         /* must not run old code while the loader writes */
     FM1_PWR_CON |= 0x10u;
     for (;;)
         ;

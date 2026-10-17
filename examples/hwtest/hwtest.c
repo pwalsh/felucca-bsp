@@ -9,17 +9,24 @@
  *   LEDs     a walk over all 41 LEDs at power-on, then each key lights its own
  *   USB      CDC serial "debug port" (115200 8N1, the rate is ignored): a status line every 250 ms
  *            and one-letter commands: h help, p print now, c last crash, x crash on purpose, w LED walk,
+ *            a the keys' readings on / off, as fm1-ctl reads them (the status line then shows rows PA7 and PA8,
+ *              then the top row's seven keys: 1023 open, lower the harder a key is pressed),
  *            k start the second core (experimental, 'cpu1=' then counts in the status line), u UBOOT, r reboot
  *
  * Two boots in a row that never reach the main loop's "healthy" point drop into UBOOT, so a
- * broken build can always be replaced. */
+ * broken build can always be replaced. The installer (tools/fm1_install.py, or a web installer) replaces hwtest over
+ * USB-MIDI like any firmware. */
 #include <stdint.h>
 #ifndef HWTEST_EXPERIMENTAL
 #define HWTEST_EXPERIMENTAL 0     /* 1: also the experimental parts (second core, a deliberate crash): hwtest-exp */
 #endif
 #define FELUCCA_CDC 1
-#define FELUCCA_OTA 0
-#define FELUCCA_ID (HWTEST_EXPERIMENTAL ? "felucca-bsp hwtest-exp" : "felucca-bsp hwtest")
+#define FELUCCA_OTA 1             /* the update entry: the installer can replace hwtest over USB-MIDI */
+#if HWTEST_EXPERIMENTAL                 /* the identity the installer sees, == the package's (fm1pkg.py --product) */
+#define FELUCCA_ID "FM-1_1210"
+#else
+#define FELUCCA_ID "FM-1_1200"
+#endif
 #define RING_PUBLISH() __asm__ volatile("" ::: "memory")
 #include "fm1_time.h"
 #include "fm1_sys.h"
@@ -29,13 +36,22 @@
 #include "fm1_cpu1.h"
 #endif
 #include "fm1_timer.h"
+/* the keys' readings ('a'): rows PA7 (an_v[0]) and PA8 (an_v[1]), and the top row through the probe (an_top);
+ * a held key read with its row driven (as fm1-ctl does) */
+static volatile uint16_t an_v[2][11], an_top[7];
+#define FM1_INPUT_ANALOG(col, rowbit, v, driven) (an_v[(rowbit) - 3u][col] = (uint16_t)(v))
+#define FM1_INPUT_PROBE(col, rowbit, v, pressed) (an_top[col] = (uint16_t)(v))
+#define FM1_INPUT_DRIVE(col, rowbit) (FM1_KEYMAP[rowbit][col] >= 14 && ((fm1_in.notes >> (FM1_KEYMAP[rowbit][col] - 14)) & 1u))
 #include "fm1_input.h"
 #include "fm1_adc.h"
 #include "fm1_lcd_hw.h"
+#include "fm1_flash.h"
 #include "libc.c"
 #include "usb.c"
+#include "ota.c"
 
 extern uint32_t _data_start[], _data_end[], _data_load[], _bss_start[], _bss_end[];
+extern uint32_t _rt_start[], _rt_end[], _rt_load[];   /* code that runs from RAM: the flash driver (fm1_flash.h) */
 
 static volatile uint32_t ms;
 #if HWTEST_EXPERIMENTAL
@@ -105,6 +121,7 @@ static void lcd_init(void)
     lcd_cmd(0x36, &madctl, 1);                  /* top-left origin, RGB */
     lcd_cmd(0x21, 0, 0);                        /* INVON: this panel is IPS */
     lcd_cmd(0x13, 0, 0);                        /* NORON */
+    lcd_cmd(0x29, 0, 0);                        /* DISPON: without it the panel stays dark */
     fm1_lcd_baud(4);
 }
 
@@ -124,6 +141,56 @@ static void lcd_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint16_t rg
         fm1_lcd_wait();
         fm1_lcd_deselect();
     }
+}
+
+/* ---- the update (ota.c): the installer's M-UPGRADE session over USB-MIDI ---- */
+static uint8_t flash_ok;                        /* the expected flash part: the update may write it */
+static uint32_t ota_now_ms(void) { return ms; }
+static void ota_idle(void) { fm1_wdt_feed(); }
+static int ota_in_area(uint32_t off, uint32_t n) { return FL_IN(off, n, OTA_AREA, OTA_AREA + OTA_AREA_LEN); }
+static int ota_erase(uint32_t off)
+{
+    uint32_t took;
+    if (!ota_in_area(off, 0x1000u) || (off & 0xFFFu))
+        return -8;
+    return fl_erase4k(off, &took);
+}
+static int ota_prog(uint32_t off, const void *p, uint32_t n)
+{
+    if (!ota_in_area(off, n))
+        return -8;
+    return fl_write(off, p, n);
+}
+static int ota_fread(uint32_t off, void *p, uint32_t n)
+{
+    uint8_t *d = p;
+    while (n) {                                 /* 256-byte windows with interrupts off */
+        uint32_t k = n > 256u ? 256u : n, f = irq_save();
+        int rc = FL_FAR(fl_read_ram)(off, d, k);
+        irq_restore(f);
+        if (rc)
+            return rc;
+        off += k;
+        d += k;
+        n -= k;
+    }
+    return 0;
+}
+static void ota_show(uint32_t step, int32_t code)   /* the steps as a bar across the bottom; red on a failure */
+{
+    lcd_rect(0, 200, 240, 24, BLK);
+    if (step < 9u)
+        lcd_rect(0, 200, step * 40u, 24, CYN);
+    else
+        lcd_rect(0, 200, 240, 24, code == 1 ? GRN : RED);
+}
+static void ota_commit(const uint8_t *parm)
+{
+    guard.pending = 0;                          /* an intentional reset, not a failed boot */
+    guard.failed = 0;
+    usb_detach();
+    fm1_delay_ms(30);
+    fm1_enter_update(parm);
 }
 
 /* a fault: red screen, then reset; the record in fm1_crash survives and is shown on the next boot ('c') */
@@ -158,12 +225,18 @@ static void draw_static(void)
         lcd_rect(ENC_X(i), 72, 30, 22, DIM);
 }
 
-static void draw_bar(uint32_t y, int32_t v, uint16_t col)   /* v 0..1023 over 232 px */
+/* v 0..1023 over 232 px, drawn when its width changes, each part once (lit, then the rest dim): painting the whole
+ * bar dim first showed as a flash on every redraw */
+static void draw_bar(uint32_t y, int32_t v, uint16_t col, uint32_t *shown)
 {
     uint32_t w = v < 0 ? 0u : (uint32_t)v * 232u / 1023u;
-    lcd_rect(4, y, 232, 12, DIM);
+    if (w == *shown)
+        return;
+    *shown = w;
     if (w)
         lcd_rect(4, y, w, 12, col);
+    if (w < 232u)
+        lcd_rect(4u + w, y, 232u - w, 12, DIM);
 }
 
 /* ---- serial console ---- */
@@ -208,6 +281,17 @@ static void status(int32_t knob, int32_t batt)
         putd("", (uint32_t)enc_pos[i]);
     }
     putd("usb_cfg=", usb.config);
+    if (fm1_an.con) {                           /* the keys' readings: PA7's eleven columns, PA8's, the top row's seven */
+        uint32_t r, c;
+        puts_("an=");
+        for (r = 0; r < 2u; r++)
+            for (c = 0; c < FM1_NCOL; c++)
+                putd("", an_v[r][c]);
+        puts_("top=");
+        for (c = 0; c < 7u; c++)
+            putd("", an_top[c]);
+        putd("an_timeouts=", fm1_an.timeouts);
+    }
 #if HWTEST_EXPERIMENTAL
     if (cpu1_started)
         putd("cpu1=", cpu1_count);
@@ -219,8 +303,8 @@ static void command(char c, int32_t knob, int32_t batt)
 {
     switch (c) {
     case 'h':
-        puts_(HWTEST_EXPERIMENTAL ? "h help, p print, c last crash, w LED walk, u UBOOT, r reboot, k start CPU1, x crash on purpose\r\n"
-                                  : "h help, p print, c last crash, w LED walk, u UBOOT, r reboot\r\n");
+        puts_(HWTEST_EXPERIMENTAL ? "h help, p print, c last crash, w LED walk, a key readings, u UBOOT, r reboot, k start CPU1, x crash on purpose\r\n"
+                                  : "h help, p print, c last crash, w LED walk, a key readings, u UBOOT, r reboot\r\n");
         break;
     case 'p':
         status(knob, batt);
@@ -252,6 +336,17 @@ static void command(char c, int32_t knob, int32_t batt)
         *(volatile uint32_t *)0 = 1;
         break;
 #endif
+    case 'a':                                   /* the keys' readings on / off, as fm1-ctl reads them */
+        if (fm1_an.con) {
+            fm1_an.con = 0;
+            puts_("key readings off\r\n");
+        } else {
+            fm1_an.drive = 1;
+            fm1_an.probe = 1;
+            fm1_an.con = (uint16_t)FM1_ADC_CON(7, 2);
+            puts_("key readings on\r\n");
+        }
+        break;
     case 'w':
         walk_until = ms + 41u * 60u;
         break;
@@ -274,6 +369,14 @@ static void app_main(void)
 {
     uint32_t i, last_status = 0, last_bar = 0, shown_btn = ~0u, shown_keys = ~0u, shown_enc = 0;
     int32_t knob = 0, batt = 0;
+    uint32_t knob_w = ~0u, batt_w = ~0u;            /* the bars' widths on the screen (~0: not drawn yet) */
+    {
+        uint32_t f = irq_save();
+        flash_ok = FL_FAR(fl_jedec_ram)() == 0x856014u;   /* the 1 MiB part every FM-1 has */
+        irq_restore(f);
+        if (flash_ok)
+            ota_boot_cleanup();                 /* what an interrupted update left behind */
+    }
     lcd_init();
     draw_static();
     fm1_input_init();
@@ -292,6 +395,13 @@ static void app_main(void)
         usb_retry(now);
         if (usb.uboot_req)                      /* the SysEx soft key */
             command('u', 0, 0);
+        ota_service();                          /* the installer's handshake */
+        if (usb.ota_req) {                      /* and its update: commits and resets, or comes back */
+            usb.ota_req = 0;
+            if (flash_ok)
+                ota_session();
+            draw_static();
+        }
         if (!boots_ok && now > 2000u) {         /* it runs: the next boot is not a loop */
             boots_ok = 1;
             guard.pending = 0;
@@ -299,10 +409,14 @@ static void app_main(void)
         }
         if (now - last_bar >= 40u) {            /* ADC: polled, a few hundred us */
             last_bar = now;
-            knob = fm1_adc_read(FM1_ADC_MASTER);
-            batt = fm1_adc_read(FM1_ADC_BATT);
-            draw_bar(28, knob, WHT);
-            draw_bar(46, batt, GRN);
+            if (fm1_an.con) {                   /* the scan owns the converter: the pot comes from it */
+                knob = fm1_an.master;
+            } else {
+                knob = fm1_adc_read(FM1_ADC_MASTER);
+                batt = fm1_adc_read(FM1_ADC_BATT);
+            }
+            draw_bar(28, knob, WHT, &knob_w);
+            draw_bar(46, batt, GRN, &batt_w);
         }
         for (i = 0; i < FM1_NENC; i++) {
             int32_t s = fm1_enc_take(i);
@@ -373,6 +487,8 @@ void fm1_cstart(void)
     for (d = _bss_start; d < _bss_end; d++)
         *d = 0;
     for (s = _data_load, d = _data_start; d < _data_end; s++, d++)
+        *d = *s;
+    for (s = _rt_load, d = _rt_start; d < _rt_end; s++, d++)    /* the flash driver, run from RAM */
         *d = *s;
     fm1_guard_enable(FM1_GUARD_STACK | FM1_GUARD_WRITE | FM1_GUARD_BUS | FM1_GUARD_PC);
     app_main();
