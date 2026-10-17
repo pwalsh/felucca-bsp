@@ -251,6 +251,9 @@ static void midi_out_event(uint32_t pkt)            /* from the audio ISR */
 #ifndef FELUCCA_CDC_DEFAULT
 #define FELUCCA_CDC_DEFAULT 1
 #endif
+#ifndef FELUCCA_USB_VID
+#define FELUCCA_USB_VID 0x1209   /* pid.codes; with PID 0x0001 its TEST id: replace both before any release */
+#endif
 /* FELUCCA_USB_MANUFACTURER, FELUCCA_USB_PRODUCT: optional ASCII strings for the USB names (string
  * descriptors 1 and 2); without them the Hügelton / Felucca names below. */
 #ifndef FELUCCA_USB_PID
@@ -336,8 +339,8 @@ static void midi_out_event(uint32_t pkt)            /* from the audio ISR */
 #define BCD_LO(cdc) (0x10 * (FELUCCA_UAC + FELUCCA_UAC_48K) + 0x40 * FELUCCA_UAC_OUT + \
                      ((cdc) ? 0x01 + 2 * FELUCCA_USB_LAYOUT : 0))
 #define D_DEV(bcdusb, cls, sub, proto, cdc)                                                          \
-    18, 1, (bcdusb) & 0xFF, (bcdusb) >> 8, (cls), (sub), (proto), 64, 0x09, 0x12, FELUCCA_USB_PID & 0xFF, \
-    FELUCCA_USB_PID >> 8, BCD_LO(cdc), 0x03, 1, 2, 0, 1
+    18, 1, (bcdusb) & 0xFF, (bcdusb) >> 8, (cls), (sub), (proto), 64, FELUCCA_USB_VID & 0xFF, FELUCCA_USB_VID >> 8, \
+    FELUCCA_USB_PID & 0xFF, FELUCCA_USB_PID >> 8, BCD_LO(cdc), 0x03, 1, 2, 0, 1
 
 /* without the console (FELUCCA_CDC=0, or usb_cdc_on = 0): class 0, no IAD, as a plain USB-MIDI / audio device */
 #define CFG_LEN_PLAIN (9 + AUD_LEN)
