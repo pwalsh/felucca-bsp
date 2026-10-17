@@ -9,8 +9,9 @@
  *     loader at 0xE0000 (outside Felucca's store), ask 0xE0000000 ("success"),
  *     then write the UPDATA_PARM record (flash 0xE4F00 + RAM 0x01C7FD88) and
  *     reset. The SPL runs the loader, which installs the package.
- * Nothing is committed before the host's "success"; any failure erases the
- * staging area and Felucca carries on.
+ * Nothing is committed before the host's "success"; a failure after the staging
+ * began erases the staging area, and Felucca carries on. A package whose flash.bin
+ * is not this board's length (OTA_FL_LEN) is refused before anything is written (-15).
  *
  * Portable core: the firmware (felucca.c) and the Mac test (ota_test.c)
  * supply these hooks:
@@ -28,6 +29,10 @@
 #define OTA_LDR_HCRC 0xEBAAu                     /* official update loader (usb_hid_ota.bin) */
 #define OTA_LDR_DCRC 0x5881u
 #define OTA_LDR_LEN 0x4DE1u
+#ifndef OTA_FL_LEN
+#define OTA_FL_LEN 0x93000u                      /* this board's flash.bin: the head and the app area, [0, the PRCT
+                                                  * end); a package for another board has another length */
+#endif
 #define OTA_FRAME_MAX 640u                       /* 512-B response = 605 wire bytes */
 
 static int ota_wire_send(const uint8_t *p, uint32_t n);
@@ -255,6 +260,7 @@ static int ota_ufw(uint8_t *hdr, uint32_t *fl_off, uint32_t *fl_len, uint32_t *o
     return 0;
 }
 
+static uint8_t ota_staged;                       /* the staging area has been touched in this session */
 static int ota_stage(void)                       /* steps 1..6; 0 = host said success */
 {
     static uint8_t hdr[0x400], b[512], mine[512];
@@ -266,6 +272,8 @@ static int ota_stage(void)                       /* steps 1..6; 0 = host said su
         return rc;
     if (!fl_off || !ota_off)
         return -3;
+    if (fl_len != OTA_FL_LEN)
+        return -15;                                         /* another board's package: refused, nothing written */
     /* 2. which loader: the official one (known CRCs; it rewrites the whole flash.bin
      *    including the head) or Felucca's own (app area only, checks the chip key) */
     if (ota_read(ota_off, b, 512))
@@ -294,6 +302,7 @@ static int ota_stage(void)                       /* steps 1..6; 0 = host said su
     if (ota_read(ota_off, b, 512))
         return -6;
     c = ota_rd16(b + 2);                                    /* outer dcrc of the body */
+    ota_staged = 1;
     for (i = 0; i < OTA_AREA_LEN; i += 0x1000u)
         if (ota_erase(OTA_AREA + i))
             return -8;
@@ -343,9 +352,11 @@ static int ota_session(void)
     uint32_t i;
     int rc;
     ota_deadline = ota_now_ms() + 120000u;          /* step 1 normally takes ~5 s; a stalled host gives up after 2 min */
+    ota_staged = 0;
     rc = ota_stage();
     if (rc) {
-        ota_unstage();
+        if (ota_staged)                             /* (a package refused before staging: no erase, no flash wear) */
+            ota_unstage();
         ota_show(9, rc);
         return rc;
     }
