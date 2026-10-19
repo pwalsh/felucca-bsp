@@ -20,7 +20,11 @@ The three SDK files (uboot.boot, cfg_tool.bin, eq_cfg_hw.bin) are Apache-2.0, no
 ship LICENSES/Apache-2.0.txt with every package (LICENSING.md; make_site.py and
 build.py --release do).
 
-  fm1pkg.py APP.bin OTA.bin OUT.fwsc [--product FM-1_9XY] [--key 0x980F]
+  fm1pkg.py APP.bin OTA.bin OUT.fwsc [--board fm1|smk37] [--product FM-1_9XY] [--key 0x980F]
+
+--board smk37 (the M-VAVE SMK-37: the same chip, SPL and update loader) selects the SMK-37's flash layout: the app
+area up to 0x9D000 (its stock PRCT), its app slot and its stock v016 region table (VM, BTIF, USRTRIM, USRFLASH, USR),
+as the stock SMK-37 Elite_016 package carries them.
 """
 import argparse
 import os
@@ -29,6 +33,31 @@ from pathlib import Path
 
 APP_SLOT = 0x8DFBC
 FLASH_SIZE = 0x93000
+# per board: the end of what the update loader writes (PRCT = FLASH_SIZE), the app slot, and the region descriptors
+# of the stock layout (absolute flash offsets; None = FLASH_SIZE; the bytes after the names are SDK packer fields)
+BOARDS = {
+    "fm1": (0x93000, 0x8DFBC, [
+        (0x93000, 352256, 0x12, 0x80, 0, bytes.fromhex("564d00ffffffffffffffffff00800000")),   # VM
+        (0, None, 0x92, 0x82, 0, bytes.fromhex("5052435400ffffffffffffff434f4445")),         # PRCT
+        (0xE9000, 0x1000, 0x92, 0x80, 0, bytes.fromhex("4254494600ffffffffffffff4155544f")),  # BTIF
+        (0xEA000, 0x12000, 0x92, 0x81, 1, "USR")]),
+    "smk37": (0x9D000, 0x97400, [                        # the stock SMK-37 v016 table
+        (0x9D000, 0x23000, 0x12, 0x81, 0, bytes.fromhex("564d00ffffffffffffffffff00800000")),  # VM
+        (0, None, 0x92, 0x82, 0, bytes.fromhex("5052435400ffffffffffffff434f4445")),         # PRCT
+        (0xC0000, 0x1000, 0x92, 0x82, 0, bytes.fromhex("4254494600ffffffffffffff4155544f")),  # BTIF
+        (0xC1000, 0x1000, 0x92, 0x81, 0, bytes.fromhex("5553525452494d00ffffffffffffffff")),  # USRTRIM
+        (0xC2000, 0x29000, 0x92, 0x81, 0, bytes.fromhex("555352464c41534800ffffffffffffff")), # USRFLASH
+        (0xF4000, 0xA000, 0x92, 0x81, 1, "USR")]),
+}
+REGIONS = BOARDS["fm1"][2]
+
+
+def set_board(board):
+    """the flash layout of a board: fm1 (the default) or smk37"""
+    global FLASH_SIZE, APP_SLOT, REGIONS
+    if board not in BOARDS:
+        raise SystemExit(f"fm1pkg: unknown board {board!r} (fm1, smk37)")
+    FLASH_SIZE, APP_SLOT, REGIONS = BOARDS[board]
 KEY = 0x980F
 # flash header: JieLi SDK defaults (burner_size 544, VID "0.01", flash_size 0xFF000,
 # fs_ver 0x10, PID "AC791N_STORY"), plain, without its CRC
@@ -135,11 +164,8 @@ def flash_image(app, key):
     area[0x120 + APP_SLOT:blk] = cfg_tool
     ents = [entry(crc16(app), 0x120, APP_SLOT, 0x82, 0xFF, 0, "app.bin"),
             entry(crc16(cfg_tool), 0x120 + APP_SLOT, len(cfg_tool), 0x82, 0xFF, 0, "cfg_tool.bin"),
-            # region descriptors; the bytes after the names are SDK packer fields (VM size, "CODE", "AUTO")
-            entry(0xFFFF, 0x93000, 352256, 0x12, 0x80, 0, bytes.fromhex("564d00ffffffffffffffffff00800000")),
-            entry(0xFFFF, 0, FLASH_SIZE, 0x92, 0x82, 0, bytes.fromhex("5052435400ffffffffffffff434f4445")),
-            entry(0xFFFF, 0xE9000, 0x1000, 0x92, 0x80, 0, bytes.fromhex("4254494600ffffffffffffff4155544f")),
-            entry(0xFFFF, 0xEA000, 0x12000, 0x92, 0x81, 1, "USR")]
+            # the board's region descriptors (BOARDS)
+            *(entry(0xFFFF, o, FLASH_SIZE if sz is None else sz, fl, rs, ix, nm) for o, sz, fl, rs, ix, nm in REGIONS)]
     area[32:32 + len(b"".join(ents))] = b"".join(ents)
     area[0:32] = entry(crc16(area[32:blk]), 0x02000120, blk, 0x83, 0xFF, 0, "app_area_head")
     # nested cfg directory right after the block: SDK default EQ table
@@ -148,6 +174,8 @@ def flash_image(app, key):
     cfg = entry(crc16(cfg_body), 0x20, 0x20 + len(cfg_body), 0x83, 0xFF, 1, "cfg") + cfg_body
     region = bytearray(area + cfg)
     sfc(region, 0, len(region), 0, key)
+    if 0x4000 + len(region) > FLASH_SIZE:                # (the update loader writes up to FLASH_SIZE only)
+        raise SystemExit(f"app area too large: ends at {0x4000 + len(region):#x}, past {FLASH_SIZE:#x}")
     f[0x4000:0x4000 + len(region)] = region
     return bytes(f)
 
@@ -197,12 +225,15 @@ def main():
     ap.add_argument("app", type=Path)
     ap.add_argument("ota", type=Path)
     ap.add_argument("out", type=Path)
-    ap.add_argument("--product", default="FM-1_900")
+    ap.add_argument("--board", choices=sorted(BOARDS), default="fm1")
+    ap.add_argument("--product", help="package identity (default FM-1_900; smk37: SMK-37 Pro_900)")
     ap.add_argument("--key", type=lambda s: int(s, 0), default=KEY)
     ap.add_argument("--sdk", type=Path, help="JieLi AC79 SDK checkout (default: $AC79_SDK)")
     a = ap.parse_args()
     global SDK
     SDK = a.sdk
+    set_board(a.board)
+    a.product = a.product or ("FM-1_900" if a.board == "fm1" else "SMK-37 Pro_900")
     pkg = ufw(flash_image(a.app.read_bytes(), a.key), a.ota.read_bytes(), a.product)
     a.out.write_bytes(pkg)
     print(f"package {a.out}: {len(pkg)} B, identity {a.product}, chip key {a.key:#06x}")

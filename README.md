@@ -33,8 +33,7 @@ belong to their owners.
 | Device | Status |
 | --- | --- |
 | M-VAVE FM-1 | Supported. Used by Felucca. |
-| M-VAVE SMK-37 Elite | Planned. Not started. |
-| M-VAVE SMK-37 Pro | Planned. No board support yet. |
+| M-VAVE SMK-37 (Pro, Elite, MKE-P37) | `boards/smk37/` (`-DBOARD_SMK37=1`, by M. Geisler): keys with velocity, buttons, encoders, pads, faders, wheels, button and pad LEDs, the screen's wiring, the flash map. The board facts were checked on an SMK-37 Pro. |
 
 "Planned" means the device is a target, not that it works. A device gets its own directory
 under `boards/` once someone has it running. Pin maps and other board facts are added only

@@ -9,6 +9,11 @@ be combined with GPL code under MPL-2.0 section 3.3.
 
 Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hügelton Instruments.
 
+`boards/smk37/` and the `BOARD_SMK37` parts of `chip/` and `loader/` (the M-VAVE SMK-37) are Copyright (C) 2026
+M. Geisler (genkigenki/makkuro), MPL-2.0, on the structure of Leo Kuroshita's `boards/fm1/`. They were taken into
+this fork from the felucca-bsp copy in github.com/genkigenki/smk37-repair (commit 622f71e, `base/bsp/`), where
+their author published them under MPL-2.0 with these SPDX headers.
+
 The JieLi AC79 SDK is Apache-2.0 and is not part of this repository. See `NOTICE`.
 
 Files were first published in Felucca under GPL-3.0-only. The copyright holder relicensed
