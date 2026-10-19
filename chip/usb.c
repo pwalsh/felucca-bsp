@@ -83,23 +83,42 @@ static struct {
  * band: ~5.8 ms). Measured under load (65 % CPU): a 64..112 band started renders at
  * 48..119 with no glitch; one render was once seen 29 frames under the floor: a packet (46) must
  * still be in hand then. */
-#define UA_N 512u                /* ring, frames (16-bit L | R << 16); a power of two */
-#if HALF_FRAMES > 128u           /* 256-frame halves: the band X0X measured for them */
-#define UA_PRIME 128u
-#define UA_LO 96u
-#define UA_HI 160u
+/* The ring is written when a render ends, so it must last through the render: the band holds 2.2 .. 3.6 ms
+ * with 256-frame halves, enough while a render takes under ~40 % of its time. FELUCCA_UAC_DEEP=1 (an app whose
+ * renders run longer) keeps a whole half more in hand: a 1024-frame ring (4 KB, FELUCCA_UAC_RING_ATTR may place
+ * it in another section), the band and the priming a half higher (+5.8 ms of latency), so a render may take its
+ * whole time. Without it a long render runs the ring dry: the packets repeat their last frame (a hold, heard as a
+ * crackle in the recording, not on the FM-1's own output). */
+#ifndef FELUCCA_UAC_DEEP
+#define FELUCCA_UAC_DEEP 0
+#endif
+#ifndef FELUCCA_UAC_RING_ATTR
+#define FELUCCA_UAC_RING_ATTR
+#endif
+#if FELUCCA_UAC_DEEP
+#define UA_N 1024u               /* ring, frames (16-bit L | R << 16); a power of two */
+#define UA_DEEP HALF_FRAMES
 #else
-#define UA_PRIME 104u            /* silence ahead of the first rendered frame */
-#define UA_LO 80u                /* a render may start late: keep a packet and more in hand */
-#define UA_HI 128u
+#define UA_N 512u
+#define UA_DEEP 0u
+#endif
+#if HALF_FRAMES > 128u           /* 256-frame halves: the band X0X measured for them */
+#define UA_PRIME (128u + UA_DEEP)
+#define UA_LO (96u + UA_DEEP)
+#define UA_HI (160u + UA_DEEP)
+#else
+#define UA_PRIME (104u + UA_DEEP)            /* silence ahead of the first rendered frame */
+#define UA_LO (80u + UA_DEEP)                /* a render may start late: keep a packet and more in hand */
+#define UA_HI (128u + UA_DEEP)
 #endif
 #define UAC_RATE 44100u
 #if FELUCCA_UAC_48K
 /* 48 kHz: the same times in 48 kHz frames (x 160 / 147); a render of HALF_FRAMES gives 139..140 frames */
-#define UA_PRIME48 113u
-#define UA_LO48 87u
-#define UA_HI48 139u
 #define UA_REND48 ((HALF_FRAMES * 160u + 146u) / 147u)
+#define UA_DEEP48 (UA_DEEP ? UA_REND48 : 0u)
+#define UA_PRIME48 (113u + UA_DEEP48)
+#define UA_LO48 (87u + UA_DEEP48)
+#define UA_HI48 (139u + UA_DEEP48)
 #define UA_MAXF 49u              /* frames in the largest packet: 48 + 1 */
 _Static_assert(UA_HI48 + UA_REND48 + UA_MAXF < UA_N, "the ring holds the band, a render and a packet (48 kHz)");
 #else
@@ -107,7 +126,7 @@ _Static_assert(UA_HI48 + UA_REND48 + UA_MAXF < UA_N, "the ring holds the band, a
 #endif
 #define UAC_MAXP (UA_MAXF * 4u)
 _Static_assert(UA_HI + HALF_FRAMES + UA_MAXF < UA_N, "the ring holds the band, a render and a packet");
-static uint32_t ua_ring[UA_N];
+static uint32_t ua_ring[UA_N] FELUCCA_UAC_RING_ATTR;
 static volatile uint32_t ua_w, ua_r;
 static uint32_t ep4tx[UA_MAXF] __attribute__((aligned(4)));
 static struct {
@@ -188,9 +207,25 @@ static uint8_t sx_frame[640];
 static uint32_t sx_pos;
 static volatile uint32_t sx_frame_len;
 static volatile uint8_t sx_ready, sx_collect, sx_busy;
-#define SXQ 64u
+#ifndef SXQ
+#define SXQ 64u                                   /* a firmware may give it more (a long screen-reader message whole) */
+#endif
 static uint32_t sx_out_q[SXQ];
 static volatile uint32_t so_w, so_r;
+#endif
+#ifndef FELUCCA_MIRROR
+#define FELUCCA_MIRROR 0
+#endif
+#if FELUCCA_MIRROR
+/* a ring for big SysEx frames that must never hold up the music (a screen mirrored to the host): whole F0..F7
+ * frames as bytes, sent last (after the SysEx ring and the notes), each whole: tx_mid says a frame is half sent
+ * (nothing else goes in between) */
+#ifndef MRQ
+#define MRQ 4096u
+#endif
+static uint8_t mr_q[MRQ];
+static volatile uint32_t mr_w, mr_r;
+static uint8_t tx_mid;                                  /* 0 between messages, 2 a mirror frame half sent */
 #endif
 
 /* MIDI rings: 4-byte USB-MIDI event packets */
@@ -226,6 +261,12 @@ static void midi_out_event(uint32_t pkt)            /* from the audio ISR */
         RING_PUBLISH();
         mo_w++;
     }
+}
+static volatile uint32_t midi_links;                /* counts up at each new connection (SET_CONFIGURATION 1) */
+static uint32_t midi_out_link(void) { return midi_links; }
+static uint32_t midi_out_room(void)                  /* free slots in the out ring (0: no host) */
+{
+    return usb.config ? MQ - (mo_w - mo_r) : 0u;
 }
 
 /* ------------------------------------------------------- descriptors --- */
@@ -718,9 +759,10 @@ static void ep0_service(void)
         if (s[2] > 1u)
             goto stall;
         usb.config = s[2];
-        if (usb.config == 1u)
+        if (usb.config == 1u) {
             ep1_config();
-        else
+            midi_links++;
+        } else
             sie_wr(S_INTRRX1E, 0);
 #if FELUCCA_UAC
         if (usb.config != 1u)
@@ -1029,7 +1071,10 @@ static void ota_frame_done(void)
 static void ep1_tx(void)
 {
     uint32_t csr, n = 0;
-#if FELUCCA_OTA
+#if FELUCCA_MIRROR
+    if (mo_w == mo_r && so_w == so_r && mr_w == mr_r)
+        return;
+#elif FELUCCA_OTA
     if (mo_w == mo_r && so_w == so_r)
         return;
 #else
@@ -1045,6 +1090,12 @@ static void ep1_tx(void)
 #if FELUCCA_OTA
     while (so_r != so_w && n < 64u) {                   /* SysEx first, never split by notes */
         uint32_t pkt = sx_out_q[so_r % SXQ];
+#if FELUCCA_MIRROR
+        if (tx_mid == 2u)
+            break;                                      /* (a mirror frame half sent: it ends first; a SysEx
+                                                         * message half written is sx_busy's, so a writer that
+                                                         * gave up never holds the notes back) */
+#endif
         ep1tx[n] = (uint8_t)pkt;
         ep1tx[n + 1] = (uint8_t)(pkt >> 8);
         ep1tx[n + 2] = (uint8_t)(pkt >> 16);
@@ -1052,7 +1103,11 @@ static void ep1_tx(void)
         n += 4u;
         so_r++;
     }
+#if FELUCCA_MIRROR
+    while (!tx_mid && !sx_busy && so_r == so_w && mo_r != mo_w && n < 64u) {
+#else
     while (!sx_busy && so_r == so_w && mo_r != mo_w && n < 64u) {
+#endif
 #else
     while (mo_r != mo_w && n < 64u) {
 #endif
@@ -1067,6 +1122,24 @@ static void ep1_tx(void)
         RING_PUBLISH();
         mo_r++;
     }
+#if FELUCCA_MIRROR
+    /* the mirror's frames last: only between other messages, and the one begun goes on to its end */
+    while (mr_r != mr_w && n < 64u && (tx_mid == 2u || (!tx_mid && !sx_busy && so_r == so_w && mo_r == mo_w))) {
+        uint32_t r = mr_r, k = 0, b[3] = {0, 0, 0};
+        RING_PUBLISH();                                 /* (whole frames are published: an F7 ends each) */
+        do
+            b[k] = mr_q[r++ % MRQ];
+        while (++k < 3u && b[k - 1u] != 0xF7u);
+        tx_mid = b[k - 1u] == 0xF7u ? 0u : 2u;
+        ep1tx[n] = (uint8_t)(tx_mid ? 4u : 4u + k);     /* CIN 4 goes on; 5, 6, 7: ends with 1, 2, 3 bytes */
+        ep1tx[n + 1] = (uint8_t)b[0];
+        ep1tx[n + 2] = (uint8_t)b[1];
+        ep1tx[n + 3] = (uint8_t)b[2];
+        n += 4u;
+        RING_PUBLISH();
+        mr_r = r;
+    }
+#endif
     if (!n)
         return;
     fm1_usb_ep_send(1, ep1tx, n);
@@ -1474,6 +1547,10 @@ static void usb_poll(void)                              /* TIMER5 ISR, 2 kHz */
 #if FELUCCA_OTA
         so_r = so_w;
         sx_collect = 0;
+#endif
+#if FELUCCA_MIRROR
+        mr_r = mr_w;
+        tx_mid = 0;
 #endif
         usb.e0_tx = 0;
         usb.has_pend_addr = 0;
