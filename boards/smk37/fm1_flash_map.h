@@ -24,14 +24,19 @@
  * FL_ERASE_GUARD), also when a caller supplies its own FL_RANGE_OK (the update loader does). */
 #pragma once
 #include <stdint.h>
+#define FL_BOARD_MAP 1                             /* chip/fm1_flash_policy.h: this board names its own windows */
 
 /* [off, off + n) inside [lo, hi), without wrapping: off + n can overflow, and the 1 MiB part ignores the high
  * address bits, so a wrapped range lands low */
-#define FL_IN(off, n, lo, hi) ((uint32_t)(off) >= (lo) && (uint32_t)(off) <= (hi) && \
-                               (uint32_t)(n) <= (hi) - (uint32_t)(off))
-/* the flash parts the app accepts (JEDEC id, 0x9F): the SMK-37's (0xEB6014, read from a unit over mask-ROM UBOOT)
- * and the FM-1's; the driver uses only generic SPI NOR commands (9F, 05/35, 06, 20, 02, 0B) */
-#define FL_JEDEC_OK(id) ((id) == 0xEB6014u || (id) == 0x856014u)
+#ifndef FL_IN
+#define FL_IN(off, n, lo, hi) ((uint32_t)(hi) >= (uint32_t)(lo) && \
+    (uint32_t)(off) >= (uint32_t)(lo) && (uint32_t)(off) <= (uint32_t)(hi) && \
+    (uint32_t)(n) <= (uint32_t)(hi) - (uint32_t)(off))
+#endif
+/* the flash parts the app accepts (JEDEC id, 0x9F): 0xEB6014 (read from a Pro over mask-ROM UBOOT), the FM-1's
+ * 0x856014 (which an Elite has reported, keremimo/saadet) and 0xB36014 (UC25HQ80, the newer FM-1s; felucca-bsp
+ * f690fa6); the driver uses only generic SPI NOR commands (9F, 05/35, 06, 20, 02, 0B) and waits out BUSY */
+#define FL_JEDEC_OK(id) ((id) == 0xEB6014u || (id) == 0x856014u || (id) == 0xB36014u)
 
 #define FL_HEAD_HI      0x00004000u                /* protected: [0, FL_HEAD_HI) */
 #define FL_CAL_LO       0x000C0000u                /* protected: BTIF + USRTRIM */
@@ -45,6 +50,7 @@
 #define FL_REC_LO       0x0009D000u                /* the update loader: where it may erase records (the VM) */
 #define FL_REC_HI       0x000C0000u
 #define FL_PLAIN_LO     0x0009D000u                /* the unencrypted XIP window, from the VM up */
+#define FM1_FLASH_PLAIN_LO FL_PLAIN_LO             /* (chip/fm1_flash_policy.h's name) */
 #define FL_DATA_LO      0x0009D000u                /* the store: objects and owner tag */
 #define FL_DATA_HI      0x000B0000u
 #define FL_OBJ_HI       0x000AF000u                /* the objects end here; the owner tag is the sector after */
