@@ -140,6 +140,7 @@ static volatile struct {
     uint16_t wheel[2], pedal, batt;   /* raw 0..1023 (mux C addresses 4, 5, 6, 7) */
     uint16_t fad_raw[4];         /* (debug: the last raw fader readings) */
     uint16_t fad_hist[4][2];     /* the two readings before: a median of 3 drops a lone spike */
+    uint8_t fad_seen;            /* bit per fader: its first reading has seeded the filter */
     uint32_t adc_ok, adc_miss;   /* (debug: conversions read / not finished within a tick) */
     uint32_t frames;
 } fm1_in;
@@ -510,6 +511,14 @@ static void smk__analog(uint32_t slot, uint32_t raw)
     } else if (a < 4u) {
         uint32_t f = SMK_FADMUX[a], h0 = fm1_in.fad_hist[f][0], h1 = fm1_in.fad_hist[f][1], m, v;
         int32_t acc = fm1_in.fad_acc[f];
+        if (!(fm1_in.fad_seen & (1u << f))) {        /* the first reading seeds the filter and the value, so a fader
+                                                      * standing high does not rise from 0 over the first scans and look
+                                                      * moved to an app (keremimo/saadet, SMK37_PORT.md 5a) */
+            fm1_in.fad_seen = (uint8_t)(fm1_in.fad_seen | 1u << f);
+            h0 = h1 = raw;
+            acc = (int32_t)raw * 16;
+            fm1_in.fader[f] = (uint8_t)(raw / 8u > 127u ? 127u : raw / 8u);
+        }
         fm1_in.fad_raw[f] = (uint16_t)raw;
         fm1_in.fad_hist[f][1] = (uint16_t)h0;
         fm1_in.fad_hist[f][0] = (uint16_t)raw;
