@@ -106,6 +106,14 @@ static volatile uint8_t smk_pad_piano;
  * row (pads 0..7) white keys 0..7, the bottom row 8..15 */
 static volatile uint8_t smk_pad_grid;
 static uint8_t smk_pad_note[SMK_NPAD];   /* the note key a pad pressed (+1; 0 = none): its release ends that one */
+/* the pads as the app's own (the UI sets smk_pad_own, e.g. for a step grid): a press is no note, only an event in
+ * the queue below (smk_pad_take); a release still ends a note its press began before. Every press and release is
+ * queued in either mode: (pad << 8 | velocity 1..127), velocity 0 for a release; pad 0..15 in reading order (the top
+ * row first: the hardware's pad index). A full queue drops the newest */
+static volatile uint8_t smk_pad_own;
+#define SMK_PADQ 32u
+static volatile uint16_t smk_padq_buf[SMK_PADQ];
+static volatile uint32_t smk_padq_w, smk_padq_r;
 #define SMK_WHITE_OF_PAD(p) ((p) < 8u ? (p) + 8u : (p) - 8u)
 
 #define SMK_TRIM_FLASH 0xC1000u   /* USRTRIM: the factory calibration record ("trimdat"), never written here */
@@ -438,7 +446,13 @@ static void smk__padq(uint32_t pad, uint32_t vel)     /* a pad hit (vel) or rele
 {
     int32_t n0 = smk_pad_piano ? SMK_PIANO_NOTE[pad] : (int32_t)SMK_WHITE_NOTE[smk_pad_grid ? pad : SMK_WHITE_OF_PAD(pad)];
     uint32_t n, bit;
+    if (smk_padq_w - smk_padq_r < SMK_PADQ) {
+        smk_padq_buf[smk_padq_w % SMK_PADQ] = (uint16_t)(pad << 8 | (vel & 0x7Fu));
+        smk_padq_w++;
+    }
     if (vel) {
+        if (smk_pad_own)
+            return;                                   /* (the app's own pads: no note) */
         if (n0 < 0)
             return;                                   /* (a gap of the piano layout) */
         smk_pad_note[pad] = (uint8_t)(n0 + 1);
@@ -638,6 +652,17 @@ static uint32_t fm1_input_note_edges(void)
     fm1_in.notes_pressed = 0;
     fm1__unlock(k);
     return p;
+}
+
+/* the next pad event (pad << 8 | velocity; velocity 0 = released), or -1 */
+static int32_t smk_pad_take(void)
+{
+    uint32_t k = fm1__lock();
+    int32_t e = -1;
+    if (smk_padq_r != smk_padq_w)
+        e = smk_padq_buf[smk_padq_r++ % SMK_PADQ];
+    fm1__unlock(k);
+    return e;
 }
 
 /* pad press edges since the last call, as note bits (0 = F3; the pads are the white keys) */
