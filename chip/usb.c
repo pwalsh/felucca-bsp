@@ -380,7 +380,6 @@ static uint8_t tx_mid;                                  /* 0 between messages, 2
 /* MIDI rings: 4-byte USB-MIDI event packets */
 #define MQ 64u
 static uint32_t midi_in_q[MQ], midi_out_q[MQ];
-static uint32_t midi_in_ms[MQ];
 static uint8_t midi_in_source[MQ];                    /* 1 USB, 2 TRS */
 static volatile uint32_t fm1_ms;                    /* also declared by core.h; parser-only host tests */
 static volatile uint32_t mi_w, mi_r, mo_w, mo_r;
@@ -413,7 +412,6 @@ static int midi_enqueue(uint32_t pkt, uint32_t source)
         return 0;
     }
     midi_in_q[at] = pkt;
-    midi_in_ms[at] = fm1_ms;
 #if FELUCCA_MIDI_STAMP
     midi_in_t24[at] = midi_rx_t;
 #endif
