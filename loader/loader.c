@@ -5,7 +5,8 @@
  * It is a USB-MIDI device "Felucca Update" (1209:0002) that answers the
  * M-UPGRADE update protocol as "ota-FM-1_900" (the SMK-37: "ota-SMK-37 Pro_900", or its model's name; hosts
  * look for "ota-"), and
- * writes the app area only (ldr_core.c). The UBOOT soft key works here too.
+ * writes the app area (ldr_core.c), and on the FM-1 an app's resource region when the package carries one (the
+ * SMK-37 has no data area for one: LDR_DATA_LO = LDR_DATA_HI). The UBOOT soft key works here too.
  * Single compilation unit. */
 #include <stdint.h>
 #define FELUCCA_LOADER 1
@@ -25,15 +26,19 @@
 #include "fm1_time.h"
 #include "fm1_sys.h"
 /* the loader may write the app area and clear update records (program over one, or erase its own staging); never
- * the head, nor Felucca's store [0x97000, 0xE0000) (user data, never a record: ldr_core.c) */
+ * the head, nor Felucca's store [0x97000, 0xE0000) (user data, never a record: ldr_core.c), but on the FM-1 for the
+ * sectors of an app's resource region while ldr_core.c writes them (ldr_res_window: in RAM, as the whole loader) */
+static uint32_t ldr_res_lo, ldr_res_hi;
 #if BOARD_SMK37
 /* the SMK-37: the app area 0x4000..0x9CFFF, and records only in the VM 0x9D000..0xBFFFF: never BTIF / USRTRIM
  * 0xC0000..0xC1FFF, USR 0xF4000.., key_mac 0xFF000, nor the stock marker (FL_APP / FL_REC, asserted in
- * boards/smk37/fm1_flash_map.h; the RAM driver also refuses every protected range on its own, FL_GUARD) */
+ * boards/smk37/fm1_flash_map.h; the RAM driver also refuses every protected range on its own, FL_GUARD). No resource
+ * window: its data area is empty (ldr_core.c), so ldr_res never opens one, and the window would not widen this */
 #define FL_RANGE_OK(off, n) FL_LDR_RANGE_OK(off, n)
 #define FL_STOCKTAG_OK(off, n) 0
 #else
-#define FL_RANGE_OK(off, n) (FL_IN(off, n, 0x4000u, 0x97000u) || FL_IN(off, n, 0xE0000u, 0xFC000u))
+#define FL_RANGE_OK(off, n) (FL_IN(off, n, 0x4000u, 0x97000u) || FL_IN(off, n, 0xE0000u, 0xFC000u) || \
+                             (ldr_res_hi && FL_IN(off, n, ldr_res_lo, ldr_res_hi)))
 #endif
 #include "fm1_flash.h"
 #include "../chip/libc.c"
@@ -129,6 +134,11 @@ static int ldr_erase_end(void)
     return fl_erase4k_end_ram(&ldr_er_saved, ldr_er_issued, &took);
 }
 static void ldr_progress(uint32_t done, uint32_t total) { ldr_screen_progress(done, total); ldr_poll(); }
+static void ldr_res_window(uint32_t lo, uint32_t hi)
+{
+    ldr_res_lo = lo;
+    ldr_res_hi = hi;
+}
 #include "ldr_core.c"
 
 extern uint32_t _bss_start[], _bss_end[];
